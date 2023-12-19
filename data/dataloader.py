@@ -1,5 +1,5 @@
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
-from vocab import ALFRED_action_dict
+from vocab import ALFRED_action_dict, CRAM_MOTOR_COMMANDS, SPECIAL_TOKENS
 import ast
 import pandas as pd
 import numpy as np
@@ -10,7 +10,6 @@ from PIL import Image
 from einops import rearrange
 
 import os
-import os.path as osp
 import pandas as pd
 from pprint import pprint
 import sys
@@ -24,54 +23,47 @@ from utils import instantiate_from_config
 
 
 class CRAMDataModule(LightningDataModule):
-    def __init__(self, train=None, validation=None, test_KAKO=None, test_KAUO=None, test_UAKO=None, test_UAUO=None, batch_size=2, num_workers=None):
+    def __init__(self, train=None, validation=None, test=None, predict=None, batch_size=2, num_workers=None, dataloader_type='subnet1'):
         super().__init__()
         self.num_workers = num_workers if num_workers is not None else 2
         self.batch_size = batch_size
 
+        self.dataloader_type = dataloader_type
+
         self.train = train
         self.validation = validation
-        self.test_KAKO = test_KAKO
-        self.test_KAUO = test_KAUO
-        self.test_UAKO = test_UAKO
-        self.test_UAUO = test_UAUO
+        self.test = test
+        self.predict = predict
         
 
     def setup(self, stage):
         if stage == 'fit':
             self.train_dataset = instantiate_from_config(self.train)
+            self.train_dataset.dataloader_type = self.dataloader_type
+            
             self.validation_dataset = instantiate_from_config(self.validation)
+            self.validation_dataset.dataloader_type = self.dataloader_type
+        
         if stage == 'test':
-            self.test_dataset_KAKO = instantiate_from_config(self.test_KAKO)
-            self.test_dataset_KAUO = instantiate_from_config(self.test_KAUO)
-            self.test_dataset_UAKO = instantiate_from_config(self.test_UAKO)
-            self.test_dataset_UAUO = instantiate_from_config(self.test_UAUO)
+            self.test_dataset = instantiate_from_config(self.test)
+            self.test_dataset.dataloader_type = self.dataloader_type
 
-        # if self.train is not None:
-        #     self.train_dataset = instantiate_from_config(self.train)
-        # if self.validation is not None:
-        #     self.validation_dataset = instantiate_from_config(self.validation)
-        # if self.test_KAKO is not None:
-        #     self.test_dataset_KAKO = instantiate_from_config(self.test_KAKO)
-        # if self.test_KAUO is not None:
-        #     self.test_dataset_KAUO = instantiate_from_config(self.test_KAUO)
-        # if self.test_UAKO is not None:
-        #     self.test_dataset_UAKO = instantiate_from_config(self.test_UAKO)
-        # if self.test_UAUO is not None:
-        #     self.test_dataset_UAUO = instantiate_from_config(self.test_UAUO)
+        if stage == 'predict':
+            self.prediction_dataset = instantiate_from_config(self.predict)
+            self.prediction_dataset.dataloader_type = self.dataloader_type
 
     ## relies on the prams being present in config file -- update
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True, collate_fn=self.train_dataset.collate_fn)
 
-    def val_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.validation_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+    def val_dataloader(self):
+        return DataLoader(self.validation_dataset, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=False, collate_fn=self.validation_dataset.collate_fn)
     
-    def test_dataloader(self) -> TRAIN_DATALOADERS:
-        return [DataLoader(self.test_dataset_KAKO, num_workers=self.num_workers), 
-                DataLoader(self.test_dataset_KAUO, num_workers=self.num_workers), 
-                DataLoader(self.test_dataset_UAKO, num_workers=self.num_workers), 
-                DataLoader(self.test_dataset_UAUO, num_workers=self.num_workers)]
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, num_workers=self.num_workers, collate_fn=self.test_dataset.collate_fn)
+    
+    def predict_dataloader(self):
+        return DataLoader(self.prediction_dataset, num_workers=self.num_workers, batch_size=self.batch_size, shuffle=False, collate_fn=self.prediction_dataset.collate_fn)
     
 
 class CRAMDataset(Dataset):
@@ -79,9 +71,11 @@ class CRAMDataset(Dataset):
         self,
         csv,
         dataset_directory,
+        dataloader_type='subnet1',
         resize_resolution = 256,
         df: pd.DataFrame = None
     ):
+        self.dataloader_type = dataloader_type
 
         if df is not None:
             self.dataset_points = df.copy()
@@ -90,6 +84,8 @@ class CRAMDataset(Dataset):
 
         self.dataset_directory = dataset_directory
         self.resize_resolution = resize_resolution
+
+        self.motor_commands_vocabulary = CRAM_MOTOR_COMMANDS + SPECIAL_TOKENS
 
     def __len__(self):
         return len(self.dataset_points)
@@ -119,39 +115,41 @@ class CRAMDataset(Dataset):
         ))
         goal_state_image = goal_state_image.resize((reize_res, reize_res), Image.Resampling.LANCZOS)
         goal_state_image = rearrange(2 * torch.tensor(np.array(goal_state_image)).float() / 255 - 1, "h w c -> c h w")
+        
+        if self.dataloader_type == 'subnet1':
+            # action desc
+            action_description = self.dataset_points.action_description[idx]
+            
+            return dict(edited=goal_state_image, edit=dict(c_concat=input_state_image, c_crossattn=action_description))
 
-        # action desc
-        action_description = self.dataset_points.action_description[idx]
-        # action_description = tokenize_by_space(
-        #     self.dataset_points.action_description[idx]
-        # )
-        # action_description = [self.action_description_vocabulary.index(
-        #     token) for token in action_description]
-        # action_description = torch.tensor(action_description)
+        elif self.dataloader_type == 'subnet2':
+            ## motor cmd
+            motor_command = self.dataset_points.motor_cmd[idx].split()
+            motor_command = [self.motor_commands_vocabulary.index(
+                token) for token in motor_command]
+            motor_command = torch.tensor(motor_command)
+            motor_command = motor_command
 
-        # # motor cmd
-        # motor_command = tokenize_by_space(
-        #     self.dataset_points.motor_cmd[idx])
-        # motor_command = [self.motor_commands_vocabulary.index(
-        #     token) for token in motor_command]
-        # motor_command = torch.tensor(motor_command)
+            return dict(start_state_image=input_state_image, goal_state_image=goal_state_image, motor_command=motor_command)
+        
 
-        return dict(edited=goal_state_image, edit=dict(c_concat=input_state_image, c_crossattn=action_description))
+    def collate_fn(self, batch):
 
-    # def collate_fn(self, batch):
-    #     batch_input_state = [input_state for input_state, _, _, _ in batch]
-    #     batch_goal_state = [goal_state for _, goal_state, _, _ in batch]
-    #     batch_action_description = [ad for _, _, ad, _ in batch]
-    #     batch_motor_commands = [motor_cmd for _, _, _, motor_cmd in batch]
+        if self.dataloader_type == 'subnet1':
+            return torch.utils.data.dataloader.default_collate(batch)
 
-    #     batch_action_description = pad_sequence(
-    #         batch_action_description, padding_value=-1)
+        elif self.dataloader_type == 'subnet2':
+            batch_input_state = torch.stack([item['start_state_image'] for item in batch])
+            batch_goal_state = torch.stack([item['goal_state_image'] for item in batch])
+            batch_motor_commands = [item['motor_command'] for item in batch]
+            
+            padding_value = self.motor_commands_vocabulary.index("[PAD]")
 
-    #     batch_motor_commands = pad_sequence(
-    #         batch_motor_commands, padding_value=-1)
+            batch_motor_commands = pad_sequence(
+                batch_motor_commands, batch_first=True, padding_value=padding_value)
 
-    #     return torch.as_tensor(batch_input_state), torch.as_tensor(batch_goal_state), torch.as_tensor(batch_action_description), torch.as_tensor(batch_motor_commands)
-
+            return dict(start_state_image=batch_input_state, goal_state_image=batch_goal_state, motor_command=batch_motor_commands)
+              
 
 class ALFRED_Dataset(Dataset):
     def __init__(self, csv_file):
